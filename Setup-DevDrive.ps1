@@ -36,7 +36,11 @@ param(
 
     [string]$VHDXPath = "C:\VHDX\DevDrive.vhdx",
 
-    [int]$SizeGB = 100
+    [int]$SizeGB = 100,
+
+    [switch]$NoPauseOnError,
+
+    [string]$ElevationLogPath = ""
 )
 
 # ============================================================================
@@ -63,6 +67,30 @@ function Write-Success {
     Write-Host "[SUCCESS] $Message" -ForegroundColor Green
 }
 
+function Wait-OnErrorClose {
+    if (-not $NoPauseOnError -and [Environment]::UserInteractive) {
+        try {
+            Read-Host "Press Enter to close this window"
+            $script:DidPauseForClose = $true
+        }
+        catch {
+            # Ignore pause failures in non-interactive hosts.
+        }
+    }
+}
+
+function Wait-OnElevatedCompletionClose {
+    if ($script:IsElevatedChildRun -and -not $script:DidPauseForClose -and [Environment]::UserInteractive) {
+        try {
+            Read-Host "Press Enter to close this elevated window"
+            $script:DidPauseForClose = $true
+        }
+        catch {
+            # Ignore pause failures in non-interactive hosts.
+        }
+    }
+}
+
 # ============================================================================
 # Admin Check
 # ============================================================================
@@ -78,40 +106,82 @@ function Request-Elevation {
         [string]$DriveLetter,
         [bool]$CreateVHDX,
         [string]$VHDXPath,
-        [int]$SizeGB
+        [int]$SizeGB,
+        [bool]$NoPauseOnError
     )
     
     Write-Warn "This script requires Administrator privileges."
     Write-Info "Requesting elevation..."
     
-    # Build arguments for elevated process
+    # Launch elevated script directly and capture elevated output via transcript.
     $scriptPath = $PSCommandPath
+    $elevatedLogPath = Join-Path -Path $env:TEMP -ChildPath ("Setup-DevDrive-elevated-{0}.log" -f [Guid]::NewGuid().ToString("N"))
+
     $elevatedArgs = @(
         "-ExecutionPolicy", "Bypass",
         "-NoProfile",
-        "-File", "`"$scriptPath`"",
+        "-File", $scriptPath,
         "-DriveLetter", $DriveLetter,
-        "-VHDXPath", "`"$VHDXPath`"",
-        "-SizeGB", $SizeGB
+        "-VHDXPath", $VHDXPath,
+        "-SizeGB", $SizeGB,
+        "-ElevationLogPath", $elevatedLogPath
     )
-    
+
     if ($CreateVHDX) {
         $elevatedArgs += "-CreateVHDX"
+    }
+
+    if ($NoPauseOnError) {
+        $elevatedArgs += "-NoPauseOnError"
     }
     
     try {
         $process = Start-Process -FilePath "powershell.exe" -ArgumentList $elevatedArgs -Verb RunAs -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            Write-Err "Elevated process exited with code $($process.ExitCode)."
+            if (Test-Path $elevatedLogPath) {
+                Write-Info "Elevated session log: $elevatedLogPath"
+                Write-Host "`n----- Elevated Session Output -----" -ForegroundColor Yellow
+                Get-Content -Path $elevatedLogPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+                Write-Host "----- End Elevated Session Output -----`n" -ForegroundColor Yellow
+            }
+            Wait-OnErrorClose
+        }
         exit $process.ExitCode
     }
     catch {
         Write-Err "Failed to elevate privileges: $_"
+        Wait-OnErrorClose
         exit 1
     }
 }
 
 # Request elevation if not already running as admin
 if (-not (Test-IsAdmin)) {
-    Request-Elevation -DriveLetter $DriveLetter -CreateVHDX $CreateVHDX -VHDXPath $VHDXPath -SizeGB $SizeGB
+    Request-Elevation -DriveLetter $DriveLetter -CreateVHDX $CreateVHDX -VHDXPath $VHDXPath -SizeGB $SizeGB -NoPauseOnError $NoPauseOnError
+}
+
+$script:TranscriptStarted = $false
+$script:DidPauseForClose = $false
+$script:IsElevatedChildRun = -not [string]::IsNullOrWhiteSpace($ElevationLogPath)
+if (-not [string]::IsNullOrWhiteSpace($ElevationLogPath)) {
+    try {
+        Start-Transcript -Path $ElevationLogPath -Force | Out-Null
+        $script:TranscriptStarted = $true
+    }
+    catch {
+        Write-Warn "Could not start transcript at ${ElevationLogPath}: $($_.Exception.Message)"
+    }
+}
+
+trap {
+    Write-Err "Unhandled error: $($_.Exception.Message)"
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch {}
+    }
+    Wait-OnErrorClose
+    Wait-OnElevatedCompletionClose
+    exit 1
 }
 
 Write-Success "Running as Administrator"
@@ -302,6 +372,10 @@ if (-not $driveExists) {
     Write-Host "VHDX Created: $($script:Summary.VHDXCreated)"
     Write-Host "Errors: $($script:Summary.Errors.Count)"
     $script:Summary.Errors | ForEach-Object { Write-Err "  - $_" }
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch {}
+    }
+    Wait-OnErrorClose
     exit 1
 }
 
@@ -606,12 +680,13 @@ foreach ($mapping in $cacheMappings) {
 # Summary Report
 # ============================================================================
 
-Write-Host "`n" 
+Write-Host ""
 Write-Host ("=" * 70) -ForegroundColor Cyan
 Write-Host "DEV DRIVE SETUP SUMMARY" -ForegroundColor Cyan
 Write-Host ("=" * 70) -ForegroundColor Cyan
 
-Write-Host "`nDrive Configuration:" -ForegroundColor Green
+Write-Host ""
+Write-Host "Drive Configuration:" -ForegroundColor Green
 Write-Host "  Drive Letter: $($script:Summary.DriveLetter):"
 if ($script:Summary.VHDXCreated) {
     Write-Host "  VHDX Created: $($script:Summary.VHDXPath)"
@@ -620,49 +695,70 @@ if ($script:Summary.VHDXCreated) {
 Write-Host "  Formatted as Dev Drive: $($script:Summary.FormattedAsDevDrive)"
 Write-Host "  Dev Drive Trusted: $($script:Summary.IsTrusted)"
 
-Write-Host "`nFilters Applied:" -ForegroundColor Green
+Write-Host ""
+Write-Host "Filters Applied:" -ForegroundColor Green
 if ($script:Summary.FiltersApplied.Count -gt 0) {
-    $script:Summary.FiltersApplied | ForEach-Object { Write-Host "  - $_" }
+    foreach ($filter in $script:Summary.FiltersApplied) {
+        Write-Host "  - $filter"
+    }
 }
 else {
     Write-Host "  (None applied or already present)"
 }
 
-Write-Host "`nCache Directories Created:" -ForegroundColor Green
+Write-Host ""
+Write-Host "Cache Directories Created:" -ForegroundColor Green
 foreach ($cacheDir in $cacheSubDirs) {
     $fullPath = Join-Path -Path $devCacheRoot -ChildPath $cacheDir
     if (Test-Path $fullPath) {
-        Write-Host "  ✓ $fullPath"
+        Write-Host "  [OK] $fullPath"
     }
 }
 
-Write-Host "`nCaches Migrated:" -ForegroundColor Green
+Write-Host ""
+Write-Host "Caches Migrated:" -ForegroundColor Green
 if ($script:Summary.CachesMigrated.Count -gt 0) {
-    $script:Summary.CachesMigrated | ForEach-Object { Write-Host "  ✓ $_" }
+    foreach ($cacheName in $script:Summary.CachesMigrated) {
+        Write-Host "  [OK] $cacheName"
+    }
 }
 else {
     Write-Host "  (None migrated or sources were empty)"
 }
 
-Write-Host "`nEnvironment Variables Set (User-Level):" -ForegroundColor Green
-$script:Summary.EnvironmentVariablesSet | ForEach-Object { 
-    $value = [Environment]::GetEnvironmentVariable($_, [EnvironmentVariableTarget]::User)
-    Write-Host "  $_ = $value"
+Write-Host ""
+Write-Host "Environment Variables Set (User-Level):" -ForegroundColor Green
+foreach ($envName in $script:Summary.EnvironmentVariablesSet) {
+    $value = [Environment]::GetEnvironmentVariable($envName, [EnvironmentVariableTarget]::User)
+    Write-Host "  $envName = $value"
 }
 
 if ($script:Summary.Errors.Count -gt 0) {
-    Write-Host "`nErrors/Warnings:" -ForegroundColor Yellow
-    $script:Summary.Errors | ForEach-Object { Write-Host "  ⚠ $_" }
+    Write-Host ""
+    Write-Host "Errors/Warnings:" -ForegroundColor Yellow
+    foreach ($err in $script:Summary.Errors) {
+        Write-Host "  [WARN] $err"
+    }
 }
 
-Write-Host "`nSetup completed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Green
+Write-Host ""
+Write-Host "Setup completed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Green
 Write-Host ("=" * 70) -ForegroundColor Cyan
 Write-Host ""
 
 # Exit with appropriate code
 if ($script:Summary.Errors.Count -gt 0) {
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch {}
+    }
+    Wait-OnErrorClose
+    Wait-OnElevatedCompletionClose
     exit 1
 }
 else {
+    if ($script:TranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch {}
+    }
+    Wait-OnElevatedCompletionClose
     exit 0
 }

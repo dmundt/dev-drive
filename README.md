@@ -67,6 +67,10 @@ See [Troubleshooting](#troubleshooting) for detailed checks and recovery steps.
 -SizeGB <int>
     Size of the VHDX in gigabytes.
     Default: 100
+
+-NoPauseOnError
+  Optional switch. When omitted, script waits for Enter before closing if errors occurred.
+  Use this switch for unattended/non-interactive runs.
 ```
 
 ## Usage Examples
@@ -306,6 +310,22 @@ cannot be loaded because running scripts is disabled on this system
    ```powershell
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
+
+### Window Closes Too Fast on Errors
+
+By default, the script now pauses on error and shows:
+
+```text
+Press Enter to close this window
+```
+
+If you are running unattended automation, disable that pause:
+
+```powershell
+.\Setup-DevDrive.ps1 -DriveLetter D -CreateVHDX -NoPauseOnError
+```
+
+When the script self-elevates via UAC, the elevated window now also waits for Enter at the end of the run so you can review console output before it closes.
 
 ### Hyper-V Cmdlets Missing (New-VHD Not Recognized)
 
