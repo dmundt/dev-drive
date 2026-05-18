@@ -298,6 +298,10 @@ cannot be loaded because running scripts is disabled on this system
 Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion
 Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All,Microsoft-Hyper-V,Microsoft-Hyper-V-Management-PowerShell
 Get-Module -ListAvailable Hyper-V
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
 ```
 
 **Enable Hyper-V cmdlets before running setup**:
