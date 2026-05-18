@@ -22,6 +22,34 @@ A production-grade PowerShell script that fully automates Dev Drive creation, co
 - **PowerShell 5.0+** (standard on Windows 11)
 - **Virtual Disk Service (VDS)** enabled (for VHDX operations)
 
+## Quick Hyper-V Setup (For -CreateVHDX)
+
+If `New-VHD` is missing, install prerequisites in this order (offline-safe):
+
+1. Confirm supported edition (Windows 11 Pro/Enterprise/Education):
+
+  ```powershell
+  Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion
+  ```
+
+2. Enable virtualization in BIOS/UEFI (Intel VT-x or AMD-V/SVM).
+
+3. Enable Hyper-V feature and reboot:
+
+  ```powershell
+  Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart
+  Restart-Computer
+  ```
+
+4. Verify cmdlets:
+
+  ```powershell
+  Import-Module Hyper-V
+  Get-Command New-VHD
+  ```
+
+See [Troubleshooting](#troubleshooting) for detailed checks and recovery steps.
+
 ## Parameters
 
 ```powershell
@@ -298,23 +326,32 @@ cannot be loaded because running scripts is disabled on this system
 Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion
 Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All,Microsoft-Hyper-V,Microsoft-Hyper-V-Management-PowerShell
 Get-Module -ListAvailable Hyper-V
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
 ```
 
-**Enable Hyper-V cmdlets before running setup**:
+**How to install Hyper-V prerequisites (offline-safe)**:
+
+1. Confirm your Windows edition supports Hyper-V (Windows 11 Pro/Enterprise/Education).
+2. Enable CPU virtualization in BIOS/UEFI (Intel VT-x or AMD-V/SVM).
+3. Run the following in an elevated PowerShell session:
 
 ```powershell
 Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart
 Restart-Computer
 ```
 
-After reboot, verify:
+4. After reboot, verify the cmdlets are available:
 
 ```powershell
+Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All,Microsoft-Hyper-V-Management-PowerShell
+Import-Module Hyper-V
 Get-Command New-VHD
+```
+
+5. If Hyper-V is still not starting, ensure the hypervisor launches at boot, then reboot:
+
+```powershell
+bcdedit /set hypervisorlaunchtype auto
+Restart-Computer
 ```
 
 If you are using PowerShell 7, run setup with Windows PowerShell 5.1:
@@ -379,7 +416,7 @@ This script is designed for **completely offline environments**:
 
 ## License
 
-Internal use for DLG admin users on Windows 11.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
 
 ## Support
 
