@@ -6,14 +6,15 @@ A production-grade PowerShell script that fully automates Dev Drive creation, co
 
 ## Features
 
-✓ **Fully Automated** - One-command Dev Drive setup  
-✓ **Offline-Safe** - No network requirements; works in isolated environments  
-✓ **Idempotent** - Safe to run multiple times without conflicts  
-✓ **VHDX Support** - Creates, mounts, and initializes virtual drives  
-✓ **Dev Drive Optimization** - ReFS formatting, filtering, and trust configuration  
-✓ **Cache Relocation** - Automatically migrates developer caches (npm, pip, cargo, go, etc.)  
-✓ **Permissions Management** - Sets ACLs and Explorer labels  
-✓ **Comprehensive Reporting** - Detailed summary of all operations  
+✓ **Fully Automated** - One-command Dev Drive setup
+✓ **Offline-Safe** - No network requirements; works in isolated environments
+✓ **Idempotent** - Safe to run multiple times without conflicts
+✓ **VHDX Support** - Creates, mounts, and initializes virtual drives
+✓ **Configurable Filesystem** - `ReFS` (default) or `NTFS` via parameter
+✓ **Dev Drive Optimization (ReFS)** - Trust and filter configuration when `-FileSystem ReFS` is selected
+✓ **Cache Relocation** - Automatically migrates developer caches (npm, pip, cargo, go, etc.)
+✓ **Permissions Management** - Sets ACLs and Explorer labels
+✓ **Comprehensive Reporting** - Detailed summary of all operations
 
 ## Requirements
 
@@ -56,6 +57,12 @@ See [Troubleshooting](#troubleshooting) for detailed checks and recovery steps.
 -DriveLetter <char>
     The drive letter (A-Z) to assign to the Dev Drive. Mandatory.
 
+-FileSystem <string>
+  Target filesystem. Allowed values: ReFS, NTFS.
+  Default: ReFS
+  Note: If an existing volume uses a different filesystem, the script fails safely
+      instead of performing destructive auto-conversion.
+
 -CreateVHDX
     Switch parameter. If specified, creates a dynamic VHDX file.
     Default: $false (uses existing volume)
@@ -90,7 +97,7 @@ This will:
 - Configure all filters and caches
 - Set environment variables for developers
 
-### 2. Configure an Existing Volume as Dev Drive
+### 2. Configure an Existing Volume as Dev Drive (ReFS Default)
 
 ```powershell
 .\Setup-DevDrive.ps1 -DriveLetter E
@@ -98,18 +105,31 @@ This will:
 
 Assumes drive `E:` already exists and will:
 
-- Format (if needed)
+- Validate filesystem alignment (fails safely on mismatch)
 - Trust the Dev Drive
 - Apply filters
 - Configure caches
 
-### 3. Create VHDX with Custom Path
+### 3. Configure an Existing NTFS Volume (No Dev Drive trust/filter)
+
+```powershell
+.\Setup-DevDrive.ps1 -DriveLetter F -FileSystem NTFS
+```
+
+Assumes drive `F:` already exists and will:
+
+- Ensure NTFS is selected and already in place (or fail safely if conversion would be destructive)
+- Skip Dev Drive trust by design
+- Skip Dev Drive filters by design
+- Configure caches
+
+### 4. Create VHDX with Custom Path
 
 ```powershell
 .\Setup-DevDrive.ps1 -DriveLetter Z -CreateVHDX -VHDXPath "D:\Storage\MyDevDrive.vhdx" -SizeGB 250
 ```
 
-### 4. Idempotent Re-configuration
+### 5. Idempotent Re-configuration
 
 Run the same command multiple times safely:
 
@@ -123,16 +143,21 @@ Run the same command multiple times safely:
 
 ### Drive Formatting
 
-- **File System**: ReFS (Resilient File System)
-- **Dev Drive Flag**: Enabled for performance optimization
+- **File System**: `ReFS` (default) or `NTFS` via `-FileSystem`
+- **Safe Conversion Behavior**: Existing-volume cross-filesystem conversion is blocked by default (fails safely)
+- **Dev Drive Flag**: Applied only when `-FileSystem ReFS` is selected
 
 ### Trust & Filters
 
-- **Trusted**: Dev Drive marked as trusted location
-- **Filters Applied**:
-  - Microsoft Defender
-  - Windows Search
-  - File History
+- When `-FileSystem ReFS` is selected:
+  - **Trusted**: Dev Drive marked as trusted location
+  - **Filters Applied**:
+    - Microsoft Defender
+    - Windows Search
+    - File History
+- When `-FileSystem NTFS` is selected:
+  - Trust operations are skipped by design
+  - Filter operations are skipped by design
 
 ### Permissions
 
@@ -195,6 +220,39 @@ powershell -ExecutionPolicy Bypass -File ".\Setup-DevDrive.ps1" -DriveLetter D -
 
 The script will automatically request elevation via UAC if not already running as admin.
 
+### ScriptBlock Execution With Parameters (English)
+
+Use this pattern when you need to run the script through a ScriptBlock while still passing explicit parameters.
+
+```powershell
+$setupBlock = {
+  & ".\Setup-DevDrive.ps1" `
+    -DriveLetter 'D' `
+    -FileSystem 'ReFS' `
+    -CreateVHDX `
+    -VHDXPath 'C:\VHDX\DevDrive.vhdx' `
+    -SizeGB 150
+}
+
+& $setupBlock
+```
+
+Practical NTFS example:
+
+```powershell
+$setupBlock = {
+  & ".\Setup-DevDrive.ps1" -DriveLetter 'F' -FileSystem 'NTFS'
+}
+
+& $setupBlock
+```
+
+Quoting guidance:
+
+- Use single quotes for literal values such as `'ReFS'`, `'NTFS'`, and `'D'`.
+- Quote paths when they can contain spaces, for example `'D:\Dev Drive\MyDevDrive.vhdx'`.
+- Keep parameter names outside quotes; only quote the parameter values.
+
 ### Persistent Execution Policy (Optional)
 
 If you want to run scripts regularly without needing `-ExecutionPolicy Bypass`:
@@ -256,7 +314,8 @@ Drive Configuration:
   Drive Letter: D:
   VHDX Created: C:\VHDX\DevDrive.vhdx
   VHDX Size: 150 GB
-  Formatted as Dev Drive: True
+  Requested FileSystem: ReFS
+  Formatted to Requested FileSystem: True
   Dev Drive Trusted: True
 
 Filters Applied:
@@ -311,21 +370,23 @@ cannot be loaded because running scripts is disabled on this system
    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
 
-### Window Closes Too Fast on Errors
+### Window Closes Too Fast
 
-By default, the script now pauses on error and shows:
+By default, the script pauses at completion and shows:
 
 ```text
 Press Enter to close this window
 ```
 
-If you are running unattended automation, disable that pause:
+This applies to both successful and failed runs in interactive console windows.
+
+If you are running unattended automation, disable the pause:
 
 ```powershell
 .\Setup-DevDrive.ps1 -DriveLetter D -CreateVHDX -NoPauseOnError
 ```
 
-When the script self-elevates via UAC, the elevated window now also waits for Enter at the end of the run so you can review console output before it closes.
+When the script self-elevates via UAC, the elevated window also waits for Enter at the end so you can review output before closing.
 
 ### Hyper-V Cmdlets Missing (New-VHD Not Recognized)
 
@@ -411,9 +472,10 @@ If your Windows edition does not support Hyper-V cmdlets, use an existing volume
 The script is fully idempotent and can be run multiple times safely:
 
 - **VHDX**: Only created if it doesn't exist
-- **Formatting**: Checked before formatting; skips if already ReFS
-- **Trust**: Verified before trusting; skips if already trusted
-- **Filters**: Checked before adding; skips if already present
+- **Formatting**: Checked against selected `-FileSystem`; skips when already aligned
+- **Cross-filesystem conversion**: Existing-volume mismatch fails safely (no automatic destructive conversion)
+- **Trust**: Verified before trusting; runs only for `-FileSystem ReFS`
+- **Filters**: Checked before adding; runs only for `-FileSystem ReFS`
 - **Caches**: Directories created only if missing
 - **Environment Variables**: Always set (overwrite safe)
 

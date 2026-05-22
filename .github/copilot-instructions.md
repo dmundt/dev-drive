@@ -18,6 +18,9 @@ param(
     [ValidatePattern('^[A-Z]$')]
     [string]$DriveLetter,
 
+    [ValidateSet('ReFS', 'NTFS')]
+    [string]$FileSystem = 'ReFS',
+
     [switch]$CreateVHDX,
 
     [string]$VHDXPath = "C:\DevDrive.vhdx",
@@ -25,6 +28,11 @@ param(
     [int]$SizeGB = 100
 )
 ```
+
+Notes:
+- `ReFS` is the default.
+- `NTFS` must be supported as an explicit option.
+- If selected filesystem differs from an existing volume and conversion would be destructive, fail safely by default instead of auto-formatting.
 
 ### 2. Admin Check
 Abort with a clear message if not running as Administrator.
@@ -43,14 +51,18 @@ Abort with a clear message if not running as Administrator.
 - Validate that `$DriveLetter` exists as a volume.
 
 ### Formatting:
-- If not already ReFS Dev Drive:
+- If `-FileSystem ReFS` and not already ReFS Dev Drive:
   ```powershell
   Format-Volume -DriveLetter $DriveLetter -FileSystem ReFS -DevDrive -Force
+  ```
+- If `-FileSystem NTFS` and not already NTFS:
+  ```powershell
+  Format-Volume -DriveLetter $DriveLetter -FileSystem NTFS -Force
   ```
 
 ---
 
-## 4. Trust the Dev Drive
+## 4. Trust the Dev Drive (ReFS only)
 Use:
 
 ```powershell
@@ -60,14 +72,16 @@ fsutil devdrv trust <DriveLetter>:
 
 Idempotent: do nothing if already trusted.
 
+If `-FileSystem NTFS` is selected, skip trust operations and report that they were skipped by design.
+
 ---
 
-## 5. Apply Dev Drive Filters
+## 5. Apply Dev Drive Filters (ReFS only)
 Ensure the following filters exist (skip silently if unsupported):
 
-- Microsoft Defender  
-- Windows Search  
-- File History  
+- Microsoft Defender
+- Windows Search
+- File History
 
 Use:
 
@@ -75,6 +89,8 @@ Use:
 fsutil devdrv queryfilters <DriveLetter>:
 fsutil devdrv addfilter <DriveLetter>: "<FilterName>"
 ```
+
+If `-FileSystem NTFS` is selected, skip filter operations and report that they were skipped by design.
 
 ---
 
@@ -160,6 +176,11 @@ At the end, print:
 - Clean, readable, production‑grade PowerShell
 - No external dependencies
 - Safe to re-run multiple times
+
+## 11. Documentation Requirements
+- Update `README.md` to document the new `-FileSystem` parameter (`ReFS` default, `NTFS` optional).
+- Explicitly state that Dev Drive trust and filter steps apply only when `-FileSystem ReFS` is selected.
+- Add an English section documenting ScriptBlock execution with parameters, including at least one practical example and quoting guidance.
 
 ---
 
