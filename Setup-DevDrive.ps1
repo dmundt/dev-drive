@@ -9,6 +9,9 @@
 .PARAMETER DriveLetter
     The drive letter to assign to the Dev Drive (single letter A-Z). Mandatory.
 
+.PARAMETER FileSystem
+    Target filesystem for the drive. Supported values: ReFS (default) or NTFS.
+
 .PARAMETER CreateVHDX
     If specified, creates and mounts a dynamic VHDX before setting up the Dev Drive.
 
@@ -32,9 +35,12 @@ param(
     [ValidatePattern('^[A-Z]$')]
     [string]$DriveLetter,
 
+    [ValidateSet('ReFS', 'NTFS')]
+    [string]$FileSystem = 'ReFS',
+
     [switch]$CreateVHDX,
 
-    [string]$VHDXPath = "C:\VHDX\DevDrive.vhdx",
+    [string]$VHDXPath = "$env:USERPROFILE\VMs\DevDrive.vhdx",
 
     [int]$SizeGB = 100,
 
@@ -67,22 +73,14 @@ function Write-Success {
     Write-Host "[SUCCESS] $Message" -ForegroundColor Green
 }
 
-function Wait-OnErrorClose {
-    if (-not $NoPauseOnError -and [Environment]::UserInteractive) {
-        try {
-            Read-Host "Press Enter to close this window"
-            $script:DidPauseForClose = $true
-        }
-        catch {
-            # Ignore pause failures in non-interactive hosts.
-        }
-    }
-}
+function Wait-OnCompletionClose {
+    param(
+        [string]$Prompt = "Press Enter to close this window"
+    )
 
-function Wait-OnElevatedCompletionClose {
-    if ($script:IsElevatedChildRun -and -not $script:DidPauseForClose -and [Environment]::UserInteractive) {
+    if (-not $NoPauseOnError -and -not $script:DidPauseForClose -and [Environment]::UserInteractive) {
         try {
-            Read-Host "Press Enter to close this elevated window"
+            Read-Host $Prompt
             $script:DidPauseForClose = $true
         }
         catch {
@@ -104,15 +102,16 @@ function Test-IsAdmin {
 function Request-Elevation {
     param(
         [string]$DriveLetter,
+        [string]$FileSystem,
         [bool]$CreateVHDX,
         [string]$VHDXPath,
         [int]$SizeGB,
         [bool]$NoPauseOnError
     )
-    
+
     Write-Warn "This script requires Administrator privileges."
     Write-Info "Requesting elevation..."
-    
+
     # Launch elevated script directly and capture elevated output via transcript.
     $scriptPath = $PSCommandPath
     $elevatedLogPath = Join-Path -Path $env:TEMP -ChildPath ("Setup-DevDrive-elevated-{0}.log" -f [Guid]::NewGuid().ToString("N"))
@@ -122,6 +121,7 @@ function Request-Elevation {
         "-NoProfile",
         "-File", $scriptPath,
         "-DriveLetter", $DriveLetter,
+        "-FileSystem", $FileSystem,
         "-VHDXPath", $VHDXPath,
         "-SizeGB", $SizeGB,
         "-ElevationLogPath", $elevatedLogPath
@@ -134,7 +134,7 @@ function Request-Elevation {
     if ($NoPauseOnError) {
         $elevatedArgs += "-NoPauseOnError"
     }
-    
+
     try {
         $process = Start-Process -FilePath "powershell.exe" -ArgumentList $elevatedArgs -Verb RunAs -Wait -PassThru
         if ($process.ExitCode -ne 0) {
@@ -145,20 +145,20 @@ function Request-Elevation {
                 Get-Content -Path $elevatedLogPath -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
                 Write-Host "----- End Elevated Session Output -----`n" -ForegroundColor Yellow
             }
-            Wait-OnErrorClose
+            Wait-OnCompletionClose
         }
         exit $process.ExitCode
     }
     catch {
         Write-Err "Failed to elevate privileges: $_"
-        Wait-OnErrorClose
+        Wait-OnCompletionClose
         exit 1
     }
 }
 
 # Request elevation if not already running as admin
 if (-not (Test-IsAdmin)) {
-    Request-Elevation -DriveLetter $DriveLetter -CreateVHDX $CreateVHDX -VHDXPath $VHDXPath -SizeGB $SizeGB -NoPauseOnError $NoPauseOnError
+    Request-Elevation -DriveLetter $DriveLetter -FileSystem $FileSystem -CreateVHDX $CreateVHDX -VHDXPath $VHDXPath -SizeGB $SizeGB -NoPauseOnError $NoPauseOnError
 }
 
 $script:TranscriptStarted = $false
@@ -179,8 +179,7 @@ trap {
     if ($script:TranscriptStarted) {
         try { Stop-Transcript | Out-Null } catch {}
     }
-    Wait-OnErrorClose
-    Wait-OnElevatedCompletionClose
+    Wait-OnCompletionClose
     exit 1
 }
 
@@ -195,20 +194,25 @@ $devCacheRoot = "$drive\Cache"
 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
 $script:Summary = @{
-    DriveLetter = $DriveLetter
-    VHDXCreated = $false
-    VHDXPath = $null
-    FormattedAsDevDrive = $false
-    IsTrusted = $false
-    FiltersApplied = @()
-    CacheDirectoriesCreated = @()
-    CachesMigrated = @()
-    EnvironmentVariablesSet = @()
-    Errors = @()
+    DriveLetter                    = $DriveLetter
+    RequestedFileSystem            = $FileSystem
+    VHDXCreated                    = $false
+    VHDXPath                       = $null
+    FormattedToRequestedFileSystem = $false
+    IsTrusted                      = $false
+    FiltersApplied                 = @()
+    SkippedSteps                   = @()
+    CacheDirectoriesCreated        = @()
+    CachesMigrated                 = @()
+    EnvironmentVariablesSet        = @()
+    Errors                         = @()
 }
+
+$script:StopProcessing = $false
 
 Write-Info "Dev Drive Setup Script Started at $timestamp"
 Write-Info "Target Drive: $drive"
+Write-Info "Requested FileSystem: $FileSystem"
 
 # ============================================================================
 # VHDX Creation (if requested)
@@ -217,7 +221,7 @@ Write-Info "Target Drive: $drive"
 if ($CreateVHDX) {
     Write-Info "VHDX creation requested..."
     $script:Summary.VHDXPath = $VHDXPath
-    
+
     # Check if VHDX already exists
     if (Test-Path $VHDXPath) {
         Write-Warn "VHDX file already exists at $VHDXPath. Skipping creation."
@@ -225,17 +229,17 @@ if ($CreateVHDX) {
     else {
         try {
             Write-Info "Creating dynamic VHDX: $VHDXPath ($SizeGB GB)"
-            
+
             # Create parent directory if needed
             $vhdxDir = Split-Path -Parent $VHDXPath
             if (-not (Test-Path $vhdxDir)) {
                 New-Item -ItemType Directory -Path $vhdxDir -Force | Out-Null
             }
-            
+
             # Create dynamic VHDX
             $vhdxSize = [int64]$SizeGB * 1GB
             New-VHD -Path $VHDXPath -SizeBytes $vhdxSize -Dynamic | Out-Null
-            
+
             Write-Success "VHDX created: $VHDXPath"
             $script:Summary.VHDXCreated = $true
             $script:Summary.VHDXPath = $VHDXPath
@@ -245,7 +249,7 @@ if ($CreateVHDX) {
             $script:Summary.Errors += "VHDX creation failed: $_"
         }
     }
-    
+
     # Mount VHDX if not already mounted
     Write-Info "Mounting VHDX..."
     $diskImage = Get-DiskImage -ImagePath $VHDXPath -ErrorAction SilentlyContinue
@@ -277,37 +281,45 @@ if ($CreateVHDX) {
         }
 
         $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction SilentlyContinue |
-            Where-Object { $_.Type -ne "Reserved" }
+        Where-Object { $_.Type -ne "Reserved" }
 
         if ($null -eq $partitions -or $partitions.Count -eq 0) {
             Write-Info "No usable partition found. Creating one..."
             New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter:$false -ErrorAction Stop | Out-Null
             $partitions = Get-Partition -DiskNumber $disk.Number -ErrorAction Stop |
-                Where-Object { $_.Type -ne "Reserved" }
+            Where-Object { $_.Type -ne "Reserved" }
             Write-Success "Partition created"
         }
 
         $targetPartition = $partitions |
-            Sort-Object -Property Size -Descending |
-            Select-Object -First 1
+        Sort-Object -Property Size -Descending |
+        Select-Object -First 1
 
         if ($null -eq $targetPartition) {
             throw "No usable partition found on VHDX disk $($disk.Number)."
         }
 
         # Ensure the partition is formatted before assigning drive letter to avoid Shell format popups.
-        Write-Info "Ensuring VHDX partition is formatted as ReFS Dev Drive..."
+        Write-Info "Ensuring VHDX partition is formatted as $FileSystem..."
         try {
             $partitionVolume = Get-Volume -Partition $targetPartition -ErrorAction SilentlyContinue
 
-            if ($null -eq $partitionVolume -or $partitionVolume.FileSystem -ne "ReFS") {
-                Write-Info "Formatting VHDX partition as ReFS Dev Drive..."
-                Format-Volume -Partition $targetPartition -FileSystem ReFS -DevDrive -Force -Confirm:$false -ErrorAction Stop | Out-Null
-                Write-Success "VHDX partition formatted as ReFS Dev Drive"
-                $script:Summary.FormattedAsDevDrive = $true
+            if ($null -eq $partitionVolume -or $partitionVolume.FileSystem -ine $FileSystem) {
+                if ($FileSystem -ieq "ReFS") {
+                    Write-Info "Formatting VHDX partition as ReFS Dev Drive..."
+                    Format-Volume -Partition $targetPartition -FileSystem ReFS -DevDrive -Force -Confirm:$false -ErrorAction Stop | Out-Null
+                    Write-Success "VHDX partition formatted as ReFS Dev Drive"
+                }
+                else {
+                    Write-Info "Formatting VHDX partition as NTFS..."
+                    Format-Volume -Partition $targetPartition -FileSystem NTFS -Force -Confirm:$false -ErrorAction Stop | Out-Null
+                    Write-Success "VHDX partition formatted as NTFS"
+                }
+                $script:Summary.FormattedToRequestedFileSystem = $true
             }
             else {
-                Write-Info "VHDX partition is already formatted as ReFS"
+                Write-Info "VHDX partition is already formatted as $FileSystem"
+                $script:Summary.FormattedToRequestedFileSystem = $true
             }
         }
         catch {
@@ -355,7 +367,7 @@ while ($retryCount -lt $maxRetries) {
         $driveExists = $true
         break
     }
-    
+
     $retryCount++
     if ($retryCount -lt $maxRetries) {
         Start-Sleep -Milliseconds 500
@@ -365,7 +377,7 @@ while ($retryCount -lt $maxRetries) {
 if (-not $driveExists) {
     Write-Err "Drive $drive does not exist. Create the partition first or use -CreateVHDX."
     $script:Summary.Errors += "Drive does not exist: $drive"
-    
+
     # Output summary and exit
     Write-Info "`n===== SETUP SUMMARY ====="
     Write-Host "Drive Letter: $($script:Summary.DriveLetter)"
@@ -385,24 +397,49 @@ Write-Success "Drive $drive is valid"
 # Dev Drive Formatting
 # ============================================================================
 
-Write-Info "Checking Dev Drive formatting on $drive..."
+Write-Info "Checking requested filesystem formatting on $drive..."
 
 try {
     $volume = Get-Volume -DriveLetter $DriveLetter -ErrorAction SilentlyContinue
-    
+
     if ($null -eq $volume) {
         Write-Warn "Volume $drive not found. Skipping format step."
     }
     else {
         if ($volume.FileSystem -eq "ReFS" -and $volume.DriveType -eq "Fixed") {
-            Write-Info "Volume is already formatted as ReFS"
-            $script:Summary.FormattedAsDevDrive = $true
+            if ($FileSystem -ieq "ReFS") {
+                Write-Info "Volume is already formatted as ReFS"
+                $script:Summary.FormattedToRequestedFileSystem = $true
+            }
+            else {
+                Write-Err "Volume $drive is currently ReFS, but -FileSystem NTFS was requested. Changing filesystem is destructive. Aborting without formatting."
+                $script:Summary.Errors += "Filesystem mismatch on existing volume ($drive): current ReFS, requested NTFS. No changes applied."
+                $script:StopProcessing = $true
+            }
+        }
+        elseif ($volume.FileSystem -ieq $FileSystem) {
+            Write-Info "Volume is already formatted as $FileSystem"
+            $script:Summary.FormattedToRequestedFileSystem = $true
         }
         else {
-            Write-Info "Formatting $drive as ReFS Dev Drive..."
-            Format-Volume -DriveLetter $DriveLetter -FileSystem ReFS -DevDrive -Force -Confirm:$false
-            Write-Success "Volume formatted as ReFS Dev Drive"
-            $script:Summary.FormattedAsDevDrive = $true
+            if (-not $CreateVHDX) {
+                Write-Err "Volume $drive is currently $($volume.FileSystem), but -FileSystem $FileSystem was requested. Changing filesystem is destructive. Aborting without formatting."
+                $script:Summary.Errors += "Filesystem mismatch on existing volume ($drive): current $($volume.FileSystem), requested $FileSystem. No changes applied."
+                $script:StopProcessing = $true
+            }
+            else {
+                if ($FileSystem -ieq "ReFS") {
+                    Write-Info "Formatting $drive as ReFS Dev Drive..."
+                    Format-Volume -DriveLetter $DriveLetter -FileSystem ReFS -DevDrive -Force -Confirm:$false
+                    Write-Success "Volume formatted as ReFS Dev Drive"
+                }
+                else {
+                    Write-Info "Formatting $drive as NTFS..."
+                    Format-Volume -DriveLetter $DriveLetter -FileSystem NTFS -Force -Confirm:$false
+                    Write-Success "Volume formatted as NTFS"
+                }
+                $script:Summary.FormattedToRequestedFileSystem = $true
+            }
         }
     }
 }
@@ -415,75 +452,87 @@ catch {
 # Dev Drive Trust
 # ============================================================================
 
-Write-Info "Checking Dev Drive trust status for $drive..."
+if (-not $script:StopProcessing -and $FileSystem -ieq "ReFS") {
+    Write-Info "Checking Dev Drive trust status for $drive..."
 
-try {
-    # Query current trust status
-    & fsutil devdrv query "$($drive)" 2>&1 | Out-Null
-    
-    if ($LASTEXITCODE -eq 0) {
-        Write-Info "Dev Drive is already trusted"
-        $script:Summary.IsTrusted = $true
-    }
-    else {
-        Write-Info "Trusting Dev Drive $drive..."
-        & fsutil devdrv trust "$($drive)" | Out-Null
-        
+    try {
+        # Query current trust status
+        & fsutil devdrv query "$($drive)" 2>&1 | Out-Null
+
         if ($LASTEXITCODE -eq 0) {
-            Write-Success "Dev Drive trusted successfully"
+            Write-Info "Dev Drive is already trusted"
             $script:Summary.IsTrusted = $true
         }
         else {
-            Write-Warn "Failed to trust Dev Drive (may already be trusted)"
+            Write-Info "Trusting Dev Drive $drive..."
+            & fsutil devdrv trust "$($drive)" | Out-Null
+
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "Dev Drive trusted successfully"
+                $script:Summary.IsTrusted = $true
+            }
+            else {
+                Write-Warn "Failed to trust Dev Drive (may already be trusted)"
+            }
         }
     }
+    catch {
+        Write-Warn "Trust operation encountered an issue: $_"
+    }
 }
-catch {
-    Write-Warn "Trust operation encountered an issue: $_"
+elseif ($FileSystem -ieq "NTFS") {
+    Write-Info "Skipping Dev Drive trust because -FileSystem NTFS was selected"
+    $script:Summary.SkippedSteps += "Dev Drive trust skipped for NTFS"
 }
 
 # ============================================================================
 # Dev Drive Filters
 # ============================================================================
 
-Write-Info "Applying Dev Drive filters for $drive..."
+if (-not $script:StopProcessing -and $FileSystem -ieq "ReFS") {
+    Write-Info "Applying Dev Drive filters for $drive..."
 
-$filters = @(
-    "Microsoft Defender",
-    "Windows Search",
-    "File History"
-)
+    $filters = @(
+        "Microsoft Defender",
+        "Windows Search",
+        "File History"
+    )
 
-$queryFilters = @()
-try {
-    $queryFilters = & fsutil devdrv queryfilters "$($drive)" 2>&1
-}
-catch {
     $queryFilters = @()
-}
-
-foreach ($filter in $filters) {
     try {
-        if ($queryFilters -like "*$filter*") {
-            Write-Info "Filter '$filter' already applied"
-        }
-        else {
-            Write-Info "Adding filter: $filter"
-            & fsutil devdrv addfilter "$($drive)" "$filter" 2>&1 | Out-Null
-            
-            if ($LASTEXITCODE -eq 0) {
-                Write-Success "Filter '$filter' added successfully"
-                $script:Summary.FiltersApplied += $filter
-                $queryFilters += $filter
-            }
-            else {
-                Write-Info "Filter '$filter' skipped (unsupported or already present)"
-            }
-        }
+        $queryFilters = & fsutil devdrv queryfilters "$($drive)" 2>&1
     }
     catch {
-        Write-Info "Filter '$filter' skipped (unsupported in this environment)"
+        $queryFilters = @()
     }
+
+    foreach ($filter in $filters) {
+        try {
+            if ($queryFilters -like "*$filter*") {
+                Write-Info "Filter '$filter' already applied"
+            }
+            else {
+                Write-Info "Adding filter: $filter"
+                & fsutil devdrv addfilter "$($drive)" "$filter" 2>&1 | Out-Null
+
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Success "Filter '$filter' added successfully"
+                    $script:Summary.FiltersApplied += $filter
+                    $queryFilters += $filter
+                }
+                else {
+                    Write-Info "Filter '$filter' skipped (unsupported or already present)"
+                }
+            }
+        }
+        catch {
+            Write-Info "Filter '$filter' skipped (unsupported in this environment)"
+        }
+    }
+}
+elseif ($FileSystem -ieq "NTFS") {
+    Write-Info "Skipping Dev Drive filters because -FileSystem NTFS was selected"
+    $script:Summary.SkippedSteps += "Dev Drive filters skipped for NTFS"
 }
 
 # ============================================================================
@@ -491,57 +540,62 @@ foreach ($filter in $filters) {
 # ============================================================================
 
 Write-Info "Setting permissions and labels for $drive..."
-
-try {
-    # Get current user
-    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-    $userName = $currentUser.Translate([System.Security.Principal.NTAccount]).Value
-    
-    Write-Info "Setting FullControl permission for $userName on $drive..."
-    
-    # Get current ACL
-    $acl = Get-Acl -Path $drive
-
-    $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-    $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
-    $accessType = [System.Security.AccessControl.AccessControlType]::Allow
-    
-    # Create new access rule with FullControl
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $userName,
-        $rights,
-        $inheritFlags,
-        $propagationFlags,
-        $accessType
-    )
-    
-    # Add the rule
-    $acl.SetAccessRule($rule)
-    Set-Acl -Path $drive -AclObject $acl
-    
-    Write-Success "Permissions set for $userName on $drive"
+if ($script:StopProcessing) {
+    Write-Warn "Skipping permissions and label steps due to earlier safe-fail condition"
+    $script:Summary.SkippedSteps += "Permissions and labeling skipped due to filesystem safety check"
 }
-catch {
-    Write-Warn "Permission setting encountered an issue: $_"
-}
+else {
+    try {
+        # Get current user
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $userName = $currentUser.Translate([System.Security.Principal.NTAccount]).Value
 
-# Set registry label
-try {
-    Write-Info "Setting Explorer label for $DriveLetter..."
-    
-    $regParent = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\$DriveLetter"
-    
-    if (-not (Test-Path $regParent)) {
-        New-Item -Path $regParent -Force | Out-Null
+        Write-Info "Setting FullControl permission for $userName on $drive..."
+
+        # Get current ACL
+        $acl = Get-Acl -Path $drive
+
+        $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+        $accessType = [System.Security.AccessControl.AccessControlType]::Allow
+
+        # Create new access rule with FullControl
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $userName,
+            $rights,
+            $inheritFlags,
+            $propagationFlags,
+            $accessType
+        )
+
+        # Add the rule
+        $acl.SetAccessRule($rule)
+        Set-Acl -Path $drive -AclObject $acl
+
+        Write-Success "Permissions set for $userName on $drive"
     }
-    
-    New-ItemProperty -Path $regParent -Name "DefaultLabel" -Value "DevDrive" -PropertyType String -Force | Out-Null
-    
-    Write-Success "Registry label set to 'DevDrive'"
-}
-catch {
-    Write-Warn "Registry label setting encountered an issue: $_"
+    catch {
+        Write-Warn "Permission setting encountered an issue: $_"
+    }
+
+    # Set registry label
+    try {
+        Write-Info "Setting Explorer label for $DriveLetter..."
+
+        $regParent = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\$DriveLetter"
+
+        if (-not (Test-Path $regParent)) {
+            New-Item -Path $regParent -Force | Out-Null
+        }
+
+        New-ItemProperty -Path $regParent -Name "DefaultLabel" -Value "DevDrive" -PropertyType String -Force | Out-Null
+
+        Write-Success "Registry label set to 'DevDrive'"
+    }
+    catch {
+        Write-Warn "Registry label setting encountered an issue: $_"
+    }
 }
 
 # ============================================================================
@@ -562,21 +616,27 @@ $cacheSubDirs = @(
     "docker"
 )
 
-foreach ($subDir in $cacheSubDirs) {
-    $cacheDir = Join-Path -Path $devCacheRoot -ChildPath $subDir
-    
-    try {
-        if (-not (Test-Path $cacheDir)) {
-            New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
-            Write-Success "Created cache directory: $cacheDir"
-            $script:Summary.CacheDirectoriesCreated += $cacheDir
+if ($script:StopProcessing) {
+    Write-Warn "Skipping cache directory creation due to earlier safe-fail condition"
+    $script:Summary.SkippedSteps += "Cache directory creation skipped due to filesystem safety check"
+}
+else {
+    foreach ($subDir in $cacheSubDirs) {
+        $cacheDir = Join-Path -Path $devCacheRoot -ChildPath $subDir
+
+        try {
+            if (-not (Test-Path $cacheDir)) {
+                New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+                Write-Success "Created cache directory: $cacheDir"
+                $script:Summary.CacheDirectoriesCreated += $cacheDir
+            }
+            else {
+                Write-Info "Cache directory already exists: $cacheDir"
+            }
         }
-        else {
-            Write-Info "Cache directory already exists: $cacheDir"
+        catch {
+            Write-Warn "Failed to create cache directory $cacheDir : $_"
         }
-    }
-    catch {
-        Write-Warn "Failed to create cache directory $cacheDir : $_"
     }
 }
 
@@ -591,88 +651,94 @@ $cacheMappings = @(
     @{
         EnvVar = "WINGET_CACHE"
         Source = "$env:LOCALAPPDATA\Microsoft\WinGet\Cache"
-        Dest = "$devCacheRoot\WinGet"
+        Dest   = "$devCacheRoot\WinGet"
     },
     @{
         EnvVar = "NPM_CACHE"
         Source = "$env:APPDATA\npm-cache"
-        Dest = "$devCacheRoot\npm"
+        Dest   = "$devCacheRoot\npm"
     },
     @{
         EnvVar = "NPM_CONFIG_CACHE"
         Source = "$env:APPDATA\npm-cache"
-        Dest = "$devCacheRoot\npm"
+        Dest   = "$devCacheRoot\npm"
     },
     @{
         EnvVar = "PIP_CACHE"
         Source = "$env:LOCALAPPDATA\pip\Cache"
-        Dest = "$devCacheRoot\pip"
+        Dest   = "$devCacheRoot\pip"
     },
     @{
         EnvVar = "CARGO_HOME"
         Source = "$env:USERPROFILE\.cargo"
-        Dest = "$devCacheRoot\cargo"
+        Dest   = "$devCacheRoot\cargo"
     },
     @{
         EnvVar = "GOCACHE"
         Source = "$env:LOCALAPPDATA\go-build"
-        Dest = "$devCacheRoot\go\build"
+        Dest   = "$devCacheRoot\go\build"
     },
     @{
         EnvVar = "GOMODCACHE"
         Source = "$env:USERPROFILE\go\pkg\mod"
-        Dest = "$devCacheRoot\go\mod"
+        Dest   = "$devCacheRoot\go\mod"
     },
     @{
         EnvVar = "GOPATH"
         Source = "$env:USERPROFILE\go"
-        Dest = "$devCacheRoot\go\path"
+        Dest   = "$devCacheRoot\go\path"
     },
     @{
         EnvVar = "DOCKER_CONFIG"
         Source = "$env:USERPROFILE\.docker"
-        Dest = "$devCacheRoot\docker"
+        Dest   = "$devCacheRoot\docker"
     }
 )
 
-foreach ($mapping in $cacheMappings) {
-    $envVar = $mapping.EnvVar
-    $source = $mapping.Source
-    $dest = $mapping.Dest
-    
-    try {
-        # Set environment variable (user-level)
-        [Environment]::SetEnvironmentVariable($envVar, $dest, [EnvironmentVariableTarget]::User)
-        Write-Success "Environment variable set: $envVar=$dest"
-        $script:Summary.EnvironmentVariablesSet += "$envVar"
-        
-        # Migrate cache if source exists and destination is empty
-        if ((Test-Path $source) -and (Get-ChildItem -Path $dest -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
-            Write-Info "Migrating cache from $source to $dest..."
-            
-            try {
-                # Use robocopy for reliable migration
-                $robocopyArgs = @($source, $dest, "/E", "/MOVE", "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS")
-                & robocopy @robocopyArgs | Out-Null
-                
-                # robocopy returns non-zero on success; we ignore exit code
-                Write-Success "Cache migrated: $envVar"
-                $script:Summary.CachesMigrated += $envVar
+if ($script:StopProcessing) {
+    Write-Warn "Skipping cache migration and environment variable updates due to earlier safe-fail condition"
+    $script:Summary.SkippedSteps += "Cache migration and environment variable setup skipped due to filesystem safety check"
+}
+else {
+    foreach ($mapping in $cacheMappings) {
+        $envVar = $mapping.EnvVar
+        $source = $mapping.Source
+        $dest = $mapping.Dest
+
+        try {
+            # Set environment variable (user-level)
+            [Environment]::SetEnvironmentVariable($envVar, $dest, [EnvironmentVariableTarget]::User)
+            Write-Success "Environment variable set: $envVar=$dest"
+            $script:Summary.EnvironmentVariablesSet += "$envVar"
+
+            # Migrate cache if source exists and destination is empty
+            if ((Test-Path $source) -and (Get-ChildItem -Path $dest -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
+                Write-Info "Migrating cache from $source to $dest..."
+
+                try {
+                    # Use robocopy for reliable migration
+                    $robocopyArgs = @($source, $dest, "/E", "/MOVE", "/NFL", "/NDL", "/NJH", "/NJS", "/NC", "/NS")
+                    & robocopy @robocopyArgs | Out-Null
+
+                    # robocopy returns non-zero on success; we ignore exit code
+                    Write-Success "Cache migrated: $envVar"
+                    $script:Summary.CachesMigrated += $envVar
+                }
+                catch {
+                    Write-Warn "Robocopy migration for $envVar encountered an issue: $_"
+                }
             }
-            catch {
-                Write-Warn "Robocopy migration for $envVar encountered an issue: $_"
+            elseif ((Test-Path $source)) {
+                Write-Info "Source cache exists at $source but destination not empty; skipping migration"
+            }
+            else {
+                Write-Info "No existing cache found at $source for $envVar"
             }
         }
-        elseif ((Test-Path $source)) {
-            Write-Info "Source cache exists at $source but destination not empty; skipping migration"
+        catch {
+            Write-Warn "Environment variable or cache migration for $envVar encountered an issue: $_"
+            $script:Summary.Errors += "Cache setup for $envVar failed: $_"
         }
-        else {
-            Write-Info "No existing cache found at $source for $envVar"
-        }
-    }
-    catch {
-        Write-Warn "Environment variable or cache migration for $envVar encountered an issue: $_"
-        $script:Summary.Errors += "Cache setup for $envVar failed: $_"
     }
 }
 
@@ -688,22 +754,39 @@ Write-Host ("=" * 70) -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Drive Configuration:" -ForegroundColor Green
 Write-Host "  Drive Letter: $($script:Summary.DriveLetter):"
+Write-Host "  Requested FileSystem: $($script:Summary.RequestedFileSystem)"
 if ($script:Summary.VHDXCreated) {
     Write-Host "  VHDX Created: $($script:Summary.VHDXPath)"
     Write-Host "  VHDX Size: $SizeGB GB"
 }
-Write-Host "  Formatted as Dev Drive: $($script:Summary.FormattedAsDevDrive)"
-Write-Host "  Dev Drive Trusted: $($script:Summary.IsTrusted)"
+Write-Host "  Formatted to Requested FileSystem: $($script:Summary.FormattedToRequestedFileSystem)"
+if ($FileSystem -ieq "ReFS") {
+    Write-Host "  Dev Drive Trusted: $($script:Summary.IsTrusted)"
+}
+else {
+    Write-Host "  Dev Drive Trusted: Skipped (NTFS selected)"
+}
 
 Write-Host ""
 Write-Host "Filters Applied:" -ForegroundColor Green
-if ($script:Summary.FiltersApplied.Count -gt 0) {
+if ($FileSystem -ieq "NTFS") {
+    Write-Host "  (Skipped because NTFS was selected)"
+}
+elseif ($script:Summary.FiltersApplied.Count -gt 0) {
     foreach ($filter in $script:Summary.FiltersApplied) {
         Write-Host "  - $filter"
     }
 }
 else {
     Write-Host "  (None applied or already present)"
+}
+
+if ($script:Summary.SkippedSteps.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Skipped Steps:" -ForegroundColor Green
+    foreach ($skippedStep in $script:Summary.SkippedSteps) {
+        Write-Host "  - $skippedStep"
+    }
 }
 
 Write-Host ""
@@ -751,14 +834,13 @@ if ($script:Summary.Errors.Count -gt 0) {
     if ($script:TranscriptStarted) {
         try { Stop-Transcript | Out-Null } catch {}
     }
-    Wait-OnErrorClose
-    Wait-OnElevatedCompletionClose
+    Wait-OnCompletionClose
     exit 1
 }
 else {
     if ($script:TranscriptStarted) {
         try { Stop-Transcript | Out-Null } catch {}
     }
-    Wait-OnElevatedCompletionClose
+    Wait-OnCompletionClose
     exit 0
 }
